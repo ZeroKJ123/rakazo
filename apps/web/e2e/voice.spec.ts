@@ -7,15 +7,15 @@ test("voice settings connect a key, speak a reply, and open a call", async ({ pa
   await signup(page, `voice-${stamp}@rakazo.test`, "password12", userName);
   await completeOnboarding(page);
 
-  await expect(page.getByRole("button", { name: "Call", exact: true })).toHaveCount(0);
   await expect(
     page.getByTestId("composer-bar").getByRole("button", { name: "Voice", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByTestId("composer-bar").getByRole("button", { name: "Hold to talk", exact: true }),
   ).toHaveCount(1);
+  await expect(page.getByTestId("call-button")).toHaveAccessibleName("Call");
   await captureScreenshot(page, testInfo, "voice-composer");
-  await page
-    .getByTestId("composer-bar")
-    .getByRole("button", { name: "Voice", exact: true })
-    .click();
+  await page.getByTestId("call-button").click();
   await expect(page.getByTestId("voice-settings")).toBeVisible();
   await expect(page.getByLabel("API key", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Dictate", exact: true })).toHaveCount(0);
@@ -77,15 +77,19 @@ test("voice settings connect a key, speak a reply, and open a call", async ({ pa
   await expect(page.getByRole("button", { name: "Disconnect", exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Close voice settings" }).click();
 
-  await page
-    .getByTestId("composer-bar")
-    .getByRole("button", { name: "Voice", exact: true })
-    .click();
+  await page.getByTestId("call-button").click();
   await expect(page.getByTestId("call-view")).toBeVisible();
+  await expect(page.getByTestId("call-view").getByText("Calling…")).toBeVisible();
   await expect(page.getByRole("button", { name: "Hang up" })).toBeVisible();
   await captureScreenshot(page, testInfo, "voice-call");
+  await page.getByRole("button", { name: "Minimize call" }).click();
+  await expect(page.getByTestId("call-view")).toHaveCount(0);
+  await expect(page.getByTestId("call-button")).toHaveAccessibleName("Open call");
+  await page.getByTestId("call-return-bar").click();
+  await expect(page.getByTestId("call-view")).toBeVisible();
   await page.getByRole("button", { name: "Hang up" }).click();
   await expect(page.getByTestId("call-view")).toHaveCount(0);
+  await expect(page.getByTestId("call-return-bar")).toHaveCount(0);
 
   await openUserSettings(page, "voice");
   const settings = page.getByTestId("voice-settings");

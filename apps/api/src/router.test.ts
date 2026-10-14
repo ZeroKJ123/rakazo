@@ -3637,6 +3637,121 @@ describe("routines.update", () => {
   });
 });
 
+describe("threads.answerCall and threads.declineCall", () => {
+  function fixture(status = "ringing", updated = 1) {
+    const appended: { type: string; payload: Record<string, unknown> }[] = [];
+    const prisma = {
+      bot: {
+        findFirst: vi
+          .fn()
+          .mockResolvedValue({ id: "bot-1", thread: { id: "thread-1" }, computer: null }),
+      },
+      message: {
+        findUnique: vi.fn().mockResolvedValue({
+          id: "message-1",
+          botId: "bot-1",
+          thread: { spaceId: "space-1" },
+          blocks: [
+            {
+              kind: "call_request",
+              callId: "call-1",
+              reason: "Send the report",
+              opening: "Hi, it's about the report.",
+              status,
+              expiresAt: "2026-10-14T18:30:45Z",
+            },
+          ],
+        }),
+        updateMany: vi.fn().mockResolvedValue({ count: updated }),
+      },
+      routine: {
+        create: vi.fn(async ({ data }: { data: Record<string, unknown> }) => ({
+          id: "routine-1",
+          ...data,
+        })),
+      },
+    } as unknown as PrismaClient;
+    const enqueue = vi.fn().mockResolvedValue(undefined);
+    const deps = {
+      prisma,
+      events: {
+        notify: vi.fn().mockResolvedValue(undefined),
+        append: vi.fn(async (event: { type: string; payload: Record<string, unknown> }) => {
+          appended.push(event);
+          return { seq: 1 };
+        }),
+      },
+      jobs: { enqueue },
+      env: { sandboxProvider: "fake" },
+    } as unknown as RouterDeps;
+    const actor = {
+      spaceId: "space-1",
+      userId: "user-1",
+      email: "user@rakazo.test",
+      isDeploymentOwner: true,
+    } satisfies Actor;
+    const handler = new RPCHandler(createRouter(deps));
+    const call = (path: string, json: Record<string, unknown>) =>
+      handler.handle(
+        new Request(`http://127.0.0.1/rpc/threads/${path}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ json: { botId: "bot-1", callId: "call-1", ...json } }),
+        }),
+        { prefix: "/rpc", context: { actor } },
+      );
+    return { prisma, appended, enqueue, call };
+  }
+
+  it("answers a ringing call with the bot's opening", async () => {
+    const { call, appended } = fixture();
+    const { response } = await call("answerCall", {});
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      json: { opening: "Hi, it's about the report.", reason: "Send the report" },
+    });
+    expect(appended[0]?.payload).toMatchObject({
+      messageId: "message-1",
+      blocks: [expect.objectContaining({ status: "answered" })],
+    });
+  });
+
+  it("refuses to answer a call that is no longer ringing", async () => {
+    const { call } = fixture("missed");
+    const { response } = await call("answerCall", {});
+    expect(response.status).toBe(409);
+  });
+
+  it("marks a declined call without scheduling another", async () => {
+    const { call, appended, prisma } = fixture();
+    const { response } = await call("declineCall", { outcome: "declined" });
+    expect(response.status).toBe(200);
+    expect(appended[0]?.payload).toMatchObject({
+      blocks: [expect.objectContaining({ status: "declined" })],
+    });
+    expect(prisma.routine.create).not.toHaveBeenCalled();
+  });
+
+  it("asks the bot to call back in ten minutes on later", async () => {
+    const { call, prisma, enqueue } = fixture();
+    const before = Date.now();
+    const { response } = await call("declineCall", { outcome: "later" });
+    expect(response.status).toBe(200);
+    expect(prisma.routine.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          botId: "bot-1",
+          threadId: "thread-1",
+          prompt: expect.stringContaining("call_user"),
+        }),
+      }),
+    );
+    const nextRunAt = vi.mocked(prisma.routine.create).mock.calls[0]?.[0]?.data?.nextRunAt as Date;
+    expect(nextRunAt.getTime() - before).toBeGreaterThanOrEqual(10 * 60_000 - 1_000);
+    expect(enqueue).toHaveBeenCalledWith(expect.objectContaining({ name: "routine.wakeup" }));
+  });
+});
+
 describe("threads.endCall", () => {
   function fixture(duplicateMarker?: boolean, userSpoke = true) {
     const created: { blocks?: unknown; clientNonce?: string }[] = [];
@@ -3670,6 +3785,8 @@ describe("threads.endCall", () => {
           .fn()
           .mockResolvedValue({ id: "bot-1", thread: { id: "thread-1" }, computer: null }),
       },
+      // No bot-placed call behind this one: only the caller's own hang-up runs.
+      message: { findUnique: vi.fn().mockResolvedValue(null) },
       taughtSkill: { findFirst: vi.fn().mockResolvedValue(null) },
       $transaction: vi.fn(async (run: (client: typeof tx) => unknown) => run(tx)),
     } as unknown as PrismaClient;
@@ -3692,12 +3809,12 @@ describe("threads.endCall", () => {
       created,
       events,
       enqueue,
-      call: () =>
+      call: (extra: Record<string, unknown> = {}) =>
         handler.handle(
           new Request("http://127.0.0.1/rpc/threads/endCall", {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ json: { botId: "bot-1", callId: "call-1" } }),
+            body: JSON.stringify({ json: { botId: "bot-1", callId: "call-1", ...extra } }),
           }),
           { prefix: "/rpc", context: { actor } },
         ),
@@ -3730,6 +3847,22 @@ describe("threads.endCall", () => {
     );
     expect(String(tx.run.create.mock.calls[0]?.[0]?.data?.clientNonce)).toMatch(/^call:call-1:/);
     expect(enqueue).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the connected time the caller reported on the card", async () => {
+    const { call, created } = fixture();
+    const { response } = await call({ durationSeconds: 83 });
+    expect(response.status).toBe(200);
+    expect(created[0]?.blocks).toEqual([
+      { kind: "voice_call", callId: "call-1", title: "", farewell: "", durationSeconds: 83 },
+    ]);
+  });
+
+  it("rejects a negative connected time", async () => {
+    const { call, created } = fixture();
+    const { response } = await call({ durationSeconds: -1 });
+    expect(response.status).toBe(400);
+    expect(created).toEqual([]);
   });
 
   it("is a no-op for a late hang-up with no user call utterance", async () => {

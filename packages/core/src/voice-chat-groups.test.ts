@@ -186,4 +186,18 @@ describe("voiceChatDuration", () => {
       Math.round((Date.parse(end.createdAt) - Date.parse(start.createdAt)) / 1000),
     );
   });
+
+  it("prefers the connected time the caller recorded on the marker", () => {
+    const start = message({ role: "user", callId: "call-1", runId: "run-1" });
+    const end = message({
+      role: "bot",
+      runId: "run-1",
+      blocks: [
+        { kind: "voice_call", callId: "call-1", title: "", farewell: "", durationSeconds: 83 },
+      ],
+    });
+    const [group] = groupVoiceChats([start, end]);
+
+    expect(group?.kind === "voiceChat" && voiceChatDuration(group)).toBe(83);
+  });
 });

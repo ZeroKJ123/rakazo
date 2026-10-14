@@ -55,6 +55,7 @@ import {
   computerSupportsUpdate,
   computerUpdateView,
   createFaviconResolver,
+  createScheduleFromTool,
   createTicket,
   createVoiceProvider,
   defaultCatalogModelId,
@@ -111,6 +112,7 @@ import {
   scriptedCatalogEntry,
   selectDefaultCredentialId,
   serializeModelSecret,
+  settleCallRequest,
   storeBotSecret,
   takeoverLeaseMs,
   toComputerRef,
@@ -152,6 +154,7 @@ import {
   ACTIVE_RUN_STATUSES,
   AttachmentValidationError,
   CALL_CLIENT_NONCE_PREFIX,
+  CALL_REQUEST_LATER_MS,
   callClientNonce,
   clampCatalogThinkingLevel,
   containsSecret,
@@ -2352,13 +2355,66 @@ export function createRouter(deps: RouterDeps) {
         }
         return { ok: true as const };
       }),
+      answerCall: authed.threads.answerCall.handler(async ({ context, input }) => {
+        const target = await resolveThreadTarget(deps.prisma, context.actor, input);
+        if (target.kind !== "bot") throw new IsolationError();
+        const answered = await settleCallRequest(deps, {
+          threadId: target.threadId,
+          callId: input.callId,
+          from: ["ringing"],
+          status: "answered",
+        });
+        if (!answered)
+          throw new ORPCError("CONFLICT", { message: "This call is no longer ringing." });
+        return { opening: answered.opening, reason: answered.reason };
+      }),
+      declineCall: authed.threads.declineCall.handler(async ({ context, input }) => {
+        const target = await resolveThreadTarget(deps.prisma, context.actor, input);
+        if (target.kind !== "bot") throw new IsolationError();
+        const declined = await settleCallRequest(deps, {
+          threadId: target.threadId,
+          callId: input.callId,
+          from: ["ringing"],
+          status: input.outcome,
+        });
+        if (declined && input.outcome === "later") {
+          // "Remind me later" is the bot's next try: a one-shot reminder in this chat.
+          await createScheduleFromTool(deps, {
+            spaceId: context.actor.spaceId,
+            botId: target.botId,
+            userId: context.actor.userId,
+            threadId: target.threadId,
+            name: `Call back: ${declined.reason}`.slice(0, 80),
+            prompt: `The user asked you to call back later about: ${declined.reason}. Call them now with call_user.`,
+            schedule: { delayMinutes: CALL_REQUEST_LATER_MS / 60_000 },
+          });
+        }
+        return { ok: true as const };
+      }),
       endCall: authed.threads.endCall.handler(async ({ context, input }) => {
         const target = await resolveThreadTarget(deps.prisma, context.actor, input);
         if (target.kind !== "bot") throw new IsolationError();
         await assertTeachingSendAllowed(deps.prisma, context.actor.spaceId, target.botId);
         const { botId, threadId } = target;
+        // The bot's own call: its card keeps how long the user stayed on.
+        await settleCallRequest(deps, {
+          threadId,
+          callId: input.callId,
+          from: ["answered"],
+          ...(input.durationSeconds === undefined
+            ? {}
+            : { durationSeconds: input.durationSeconds }),
+        });
         const blocks = [
-          { kind: "voice_call" as const, callId: input.callId, title: "", farewell: "" },
+          {
+            kind: "voice_call" as const,
+            callId: input.callId,
+            title: "",
+            farewell: "",
+            ...(input.durationSeconds === undefined
+              ? {}
+              : { durationSeconds: input.durationSeconds }),
+          },
         ];
         const committed = await deps.prisma
           .$transaction(async (tx) => {
